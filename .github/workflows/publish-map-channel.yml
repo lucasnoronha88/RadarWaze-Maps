@@ -1,0 +1,88 @@
+name: Atualizar canal publico dos mapas
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 7 * * *'
+  push:
+    paths:
+      - '.github/workflows/publish-map-channel.yml'
+      - 'tools/check_map_source.py'
+      - 'tools/prepare_map_channel.py'
+      - 'tools/build_road_graph_v2.py'
+      - 'tools/test_map_channel.py'
+permissions:
+  contents: read
+concurrency:
+  group: map-channel-publisher
+  cancel-in-progress: false
+jobs:
+  publish:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      MAP_PUBLIC_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate channel publisher
+        run: python3 tools/test_map_channel.py
+      - name: Compare source revision
+        id: source
+        run: python3 tools/check_map_source.py
+      - name: Install converter
+        if: steps.source.outputs.changed == 'true'
+        run: python3 -m pip install osmium
+      - name: Download upstream and convert for Android
+        if: steps.source.outputs.changed == 'true'
+        run: |
+          curl --fail --location --retry 4 --connect-timeout 30 -o sp.osm.pbf https://download.openstreetmap.fr/extracts/south-america/brazil/southeast/sao-paulo-latest.osm.pbf
+          python3 tools/build_road_graph_v2.py sp.osm.pbf --output sp-road-graph-v2.zip --scope full-sp
+      - name: Prepare versioned channel
+        if: steps.source.outputs.changed == 'true'
+        id: channel
+        env:
+          PUBLIC_REPOSITORY: ${{ steps.source.outputs.repository }}
+        run: |
+          python3 - <<'PY'
+          import os,zipfile,json
+          from pathlib import Path
+          import sys
+          sys.path.insert(0,'tools')
+          from prepare_map_channel import prepare
+          with zipfile.ZipFile('sp-road-graph-v2.zip') as z: version=json.loads(z.read('manifest.json'))['version']
+          name=f'sp-road-graph-v2-{version}.zip'
+          Path('sp-road-graph-v2.zip').rename(name)
+          repo=os.environ['PUBLIC_REPOSITORY']
+          prepare(name,f'https://github.com/{repo}/releases/download/sp-roadmap/{name}',Path('source-revision.txt').read_text(),'latest.json')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out:out.write(f'package={name}\n')
+          PY
+      - name: Publish package before channel pointer
+        if: steps.source.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_REPOSITORY: ${{ steps.source.outputs.repository }}
+          PACKAGE: ${{ steps.channel.outputs.package }}
+        run: |
+          test "$(gh api "repos/$PUBLIC_REPOSITORY" --jq '.private')" = false
+          if ! gh release view sp-roadmap --repo "$PUBLIC_REPOSITORY" >/dev/null 2>&1; then
+            gh release create sp-roadmap --repo "$PUBLIC_REPOSITORY" --title 'Mapas SP para Radar Waze' --notes 'Dados © OpenStreetMap contributors, ODbL 1.0. Pacotes preparados para Android; roteamento em diagnóstico.'
+          fi
+          gh release upload sp-roadmap "$PACKAGE" --repo "$PUBLIC_REPOSITORY" --clobber
+          gh release upload sp-roadmap latest.json --repo "$PUBLIC_REPOSITORY" --clobber
+      - name: Verify published channel
+        if: steps.source.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download sp-roadmap --pattern latest.json --repo "$GITHUB_REPOSITORY" --dir verification
+          cmp latest.json verification/latest.json
+      - name: Keep channel audit files
+        if: steps.source.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-map-channel-audit
+          path: |
+            latest.json
+            source-revision.txt
+          retention-days: 30
